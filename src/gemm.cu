@@ -49,12 +49,28 @@ void gemm_cuda(const size_t m, const size_t n, const size_t k, const T alpha,
   const dim3 block(16, 16, 1);
   const dim3 grid(CEIL_DIV(n, 16), CEIL_DIV(m, 16));
 
-  gemm_kernel<<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
 
-  // cudaDeviceSynchronize();
+  cudaEventRecord(start);
+  gemm_kernel<<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
+  cudaEventRecord(stop);
+
+  cudaEventSynchronize(stop);
+  float millisec = 0;
+  cudaEventElapsedTime(&millisec, start, stop);
+  const double sec = double(millisec) / 1e3;
+  const double gflops = double(m * n * k * 2) / sec / 1e9;
+  [[maybe_unused]] const double band =
+      double(m * k + k * n + m * n) * sizeof(T) / sec / 1e9;
+
+  printf("%4ld, %4ld, %4ld, %8.2f, %9.6f\n", m, n, k, gflops, sec);
 
   CUDA_CHECK(cudaMemcpy(C, d_C, m * n * sizeof(T), cudaMemcpyDeviceToHost));
 
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
   CUDA_CHECK(cudaFree(d_A));
   CUDA_CHECK(cudaFree(d_B));
   CUDA_CHECK(cudaFree(d_C));

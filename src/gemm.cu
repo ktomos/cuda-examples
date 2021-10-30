@@ -19,17 +19,36 @@ template void gemm_cpu(const size_t m, const size_t n, const size_t k,
                        const float alpha, const float *A, const float *B,
                        const float beta, float *C);
 
-template <typename T>
+template <typename T, int BLOCK_SIZE>
 __global__ void gemm_kernel(const size_t m, const size_t n, const size_t k,
                             const T alpha, const T *A, const T *B, const T beta,
                             T *C) {
-  const int idx = blockDim.x * blockIdx.x + threadIdx.x;
-  const int idy = blockDim.y * blockIdx.y + threadIdx.y;
-  if (idx < n && idy < m) {
-    T value = 0;
-    for (size_t i = 0; i < k; ++i) {
-      value += A[idy * k + i] * B[i * n + idx];
+  __shared__ T shared_A[BLOCK_SIZE][BLOCK_SIZE]; // m x k
+  __shared__ T shared_B[BLOCK_SIZE][BLOCK_SIZE]; // k x n
+
+  const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+  const int idy = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+
+  T value = 0;
+
+  int kb;
+  for (kb = 0; kb < k / BLOCK_SIZE; ++kb) {
+    int k_base = kb * BLOCK_SIZE;
+    shared_A[threadIdx.y][threadIdx.x] = A[idy * k + (k_base + threadIdx.x)];
+    shared_B[threadIdx.y][threadIdx.x] = B[(k_base + threadIdx.y) * n + idx];
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+      value += shared_A[threadIdx.y][i] * shared_B[i][threadIdx.x];
     }
+    __syncthreads();
+  }
+
+  for (size_t i = kb * BLOCK_SIZE; i < k; ++i) {
+    value += A[idy * k + i] * B[i * n + idx];
+  }
+  if (idx < n && idy < m) {
     C[idy * n + idx] = alpha * value + beta;
   }
 }
@@ -46,15 +65,18 @@ void gemm_cuda(const size_t m, const size_t n, const size_t k, const T alpha,
   CUDA_CHECK(cudaMemcpy(d_A, A, m * k * sizeof(T), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_B, B, k * n * sizeof(T), cudaMemcpyHostToDevice));
 
-  const dim3 block(16, 16, 1);
-  const dim3 grid(CEIL_DIV(n, 16), CEIL_DIV(m, 16));
+  const int BLOCK_SIZE = 16;
+
+  const dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+  const dim3 grid(CEIL_DIV(n, BLOCK_SIZE), CEIL_DIV(m, BLOCK_SIZE));
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
   cudaEventRecord(start);
-  gemm_kernel<<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
+  gemm_kernel<T, BLOCK_SIZE>
+      <<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);

@@ -57,26 +57,32 @@ TEST_P(GemmTest, ParamTest) { runtest(GetParam()); }
 using testing::Combine;
 using testing::Values;
 
-INSTANTIATE_TEST_CASE_P(GemmMNKTest1, GemmTest,
+INSTANTIATE_TEST_CASE_P(GemmMNKBasicTest, GemmTest,
                         Combine(Values(16, 64), // m
                                 Values(16, 64), // n
                                 Values(16, 64), // k
                                 Values(1.0),    // alpha
                                 Values(1.0)));  // beta
 
-INSTANTIATE_TEST_CASE_P(GemmMNKTest2, GemmTest,
+INSTANTIATE_TEST_CASE_P(GemmMNKSmallTest, GemmTest,
                         Combine(Values(1, 2, 3), // m
                                 Values(1, 2, 3), // n
                                 Values(1, 2, 3), // k
                                 Values(1.0),     // alpha
                                 Values(1.0)));   // beta
 
-INSTANTIATE_TEST_CASE_P(GemmMNKTest3, GemmTest,
-                        Combine(Values(19, 63), // m
-                                Values(19, 63), // n
-                                Values(19, 63), // k
+INSTANTIATE_TEST_CASE_P(GemmMNKEdgeTest, GemmTest,
+                        Combine(Values(61, 67), // m
+                                Values(61, 67), // n
+                                Values(61, 67), // k
                                 Values(1.0),    // alpha
                                 Values(1.0)));  // beta
+
+INSTANTIATE_TEST_CASE_P(GemmMNKLargeTest, GemmTest,
+                        Values(GemmParams(128, 128, 128, 1.0, 1.0),
+                               GemmParams(256, 256, 256, 1.0, 1.0),
+                               GemmParams(512, 512, 512, 1.0, 1.0),
+                               GemmParams(500, 500, 500, 1.0, 1.0)));
 
 INSTANTIATE_TEST_CASE_P(GemmAlphaBetaTest, GemmTest,
                         Combine(Values(16),              // m

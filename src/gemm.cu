@@ -19,37 +19,88 @@ template void gemm_cpu(const size_t m, const size_t n, const size_t k,
                        const float alpha, const float *A, const float *B,
                        const float beta, float *C);
 
-template <typename T, int BLOCK_SIZE>
-__global__ void gemm_kernel(const size_t m, const size_t n, const size_t k,
+struct GemmParam {
+  static constexpr int THREAD_X = 16;
+  static constexpr int THREAD_Y = 16;
+
+  // register blocking per thread
+  static constexpr int MR = 8;
+  static constexpr int NR = 4;
+
+  // sheard memory blocking per grid
+  static constexpr int MB = THREAD_Y * MR;
+  static constexpr int NB = THREAD_X * NR;
+  static constexpr int KB = 8;
+
+  // number of memory load per thread
+  static_assert((MB * KB) % (THREAD_X * THREAD_Y) == 0);
+  static_assert((KB * NB) % (THREAD_X * THREAD_Y) == 0);
+  static constexpr int N_LOADS_A = (MB * KB) / (THREAD_X * THREAD_Y);
+  static constexpr int N_LOADS_B = (KB * NB) / (THREAD_X * THREAD_Y);
+};
+
+template <typename T, typename Param>
+__global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
                             const T alpha, const T *A, const T *B, const T beta,
                             T *C) {
-  __shared__ T shared_A[BLOCK_SIZE][BLOCK_SIZE]; // m x k
-  __shared__ T shared_B[BLOCK_SIZE][BLOCK_SIZE]; // k x n
+  __shared__ T shared_A[Param::MB][Param::KB]; // MB x KB
+  __shared__ T shared_B[Param::KB][Param::NB]; // KB x NB
 
-  const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-  const int idy = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+  const int n_base = blockIdx.x * Param::NB;
+  const int m_base = blockIdx.y * Param::MB;
+  const int tidx = threadIdx.x, tidy = threadIdx.y;
 
-  T value = 0;
+  T value[Param::MR][Param::NR] = {};
 
-  int kb;
-  for (kb = 0; kb < k / BLOCK_SIZE; ++kb) {
-    int k_base = kb * BLOCK_SIZE;
-    shared_A[threadIdx.y][threadIdx.x] = A[idy * k + (k_base + threadIdx.x)];
-    shared_B[threadIdx.y][threadIdx.x] = B[(k_base + threadIdx.y) * n + idx];
+  int k_base = 0;
+  for (k_base = 0; k_base + Param::KB <= K; k_base += Param::KB) {
+    for (int i = 0; i < Param::N_LOADS_A; ++i) {
+      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
+      const int sheard_m_ofs = index / Param::KB;
+      const int sheard_k_ofs = index % Param::KB;
+      shared_A[sheard_m_ofs][sheard_k_ofs] =
+          A[(m_base + sheard_m_ofs) * K + (k_base + sheard_k_ofs)];
+    }
+    for (int i = 0; i < Param::N_LOADS_B; ++i) {
+      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
+      const int sheard_k_ofs = index / Param::NB;
+      const int sheard_n_ofs = index % Param::NB;
+      shared_B[sheard_k_ofs][sheard_n_ofs] =
+          B[(k_base + sheard_k_ofs) * N + (n_base + sheard_n_ofs)];
+    }
     __syncthreads();
 
-#pragma unroll
-    for (int i = 0; i < BLOCK_SIZE; ++i) {
-      value += shared_A[threadIdx.y][i] * shared_B[i][threadIdx.x];
+    for (int mr = 0; mr < Param::MR; ++mr) {
+      for (int nr = 0; nr < Param::NR; ++nr) {
+        for (int sheard_k_ofs = 0; sheard_k_ofs < Param::KB; ++sheard_k_ofs) {
+          const int sheard_n_ofs = nr * Param::THREAD_X + tidx;
+          const int sheard_m_ofs = mr * Param::THREAD_Y + tidy;
+          value[mr][nr] += shared_A[sheard_m_ofs][sheard_k_ofs] *
+                           shared_B[sheard_k_ofs][sheard_n_ofs];
+        }
+      }
     }
     __syncthreads();
   }
 
-  for (size_t i = kb * BLOCK_SIZE; i < k; ++i) {
-    value += A[idy * k + i] * B[i * n + idx];
+  for (int k_ofs = k_base; k_ofs < K; ++k_ofs) {
+    for (int mr = 0; mr < Param::MR; ++mr) {
+      for (int nr = 0; nr < Param::NR; ++nr) {
+        const int n_ofs = n_base + nr * Param::THREAD_X + tidx;
+        const int m_ofs = m_base + mr * Param::THREAD_Y + tidy;
+        value[mr][nr] += A[m_ofs * K + k_ofs] * B[k_ofs * N + n_ofs];
+      }
+    }
   }
-  if (idx < n && idy < m) {
-    C[idy * n + idx] = alpha * value + beta;
+
+  for (int mr = 0; mr < Param::MR; ++mr) {
+    for (int nr = 0; nr < Param::NR; ++nr) {
+      const int n_ofs = n_base + nr * Param::THREAD_X + tidx;
+      const int m_ofs = m_base + mr * Param::THREAD_Y + tidy;
+      if (n_ofs < N && m_ofs < M) {
+        C[m_ofs * N + n_ofs] = alpha * value[mr][nr] + beta;
+      }
+    }
   }
 }
 
@@ -65,17 +116,15 @@ void gemm_cuda(const size_t m, const size_t n, const size_t k, const T alpha,
   CUDA_CHECK(cudaMemcpy(d_A, A, m * k * sizeof(T), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_B, B, k * n * sizeof(T), cudaMemcpyHostToDevice));
 
-  const int BLOCK_SIZE = 16;
-
-  const dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-  const dim3 grid(CEIL_DIV(n, BLOCK_SIZE), CEIL_DIV(m, BLOCK_SIZE));
+  const dim3 block(GemmParam::THREAD_X, GemmParam::THREAD_Y);
+  const dim3 grid(CEIL_DIV(n, GemmParam::NB), CEIL_DIV(m, GemmParam::MB));
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
   cudaEventRecord(start);
-  gemm_kernel<T, BLOCK_SIZE>
+  gemm_kernel<T, GemmParam>
       <<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
   cudaEventRecord(stop);
 

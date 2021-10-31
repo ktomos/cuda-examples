@@ -43,44 +43,79 @@ template <typename T, typename Param>
 __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
                             const T alpha, const T *A, const T *B, const T beta,
                             T *C) {
-  __shared__ T shared_A[Param::MB][Param::KB]; // MB x KB
-  __shared__ T shared_B[Param::KB][Param::NB]; // KB x NB
+  __shared__ T shared_A[2][Param::MB][Param::KB]; // 2 x MB x KB
+  __shared__ T shared_B[2][Param::KB][Param::NB]; // 2 x KB x NB
 
   const int n_base = blockIdx.x * Param::NB;
   const int m_base = blockIdx.y * Param::MB;
   const int tidx = threadIdx.x, tidy = threadIdx.y;
 
   T value[Param::MR][Param::NR] = {};
+  T a_buffer[Param::N_LOADS_A], b_buffer[Param::N_LOADS_B];
 
-  int k_base = 0;
-  for (k_base = 0; k_base + Param::KB <= K; k_base += Param::KB) {
+  auto load_mem_to_reg = [&](int k_base) {
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
       const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
       const int sheard_m_ofs = index / Param::KB;
       const int sheard_k_ofs = index % Param::KB;
-      shared_A[sheard_m_ofs][sheard_k_ofs] =
-          A[(m_base + sheard_m_ofs) * K + (k_base + sheard_k_ofs)];
+      a_buffer[i] = A[(m_base + sheard_m_ofs) * K + (k_base + sheard_k_ofs)];
     }
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
       const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
       const int sheard_k_ofs = index / Param::NB;
       const int sheard_n_ofs = index % Param::NB;
-      shared_B[sheard_k_ofs][sheard_n_ofs] =
-          B[(k_base + sheard_k_ofs) * N + (n_base + sheard_n_ofs)];
+      b_buffer[i] = B[(k_base + sheard_k_ofs) * N + (n_base + sheard_n_ofs)];
     }
-    __syncthreads();
+  };
 
+  auto store_reg_to_shared_mem = [&](int shead_mem_id) {
+    for (int i = 0; i < Param::N_LOADS_A; ++i) {
+      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
+      const int sheard_m_ofs = index / Param::KB;
+      const int sheard_k_ofs = index % Param::KB;
+      shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] = a_buffer[i];
+    }
+    for (int i = 0; i < Param::N_LOADS_B; ++i) {
+      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
+      const int sheard_k_ofs = index / Param::NB;
+      const int sheard_n_ofs = index % Param::NB;
+      shared_B[shead_mem_id][sheard_k_ofs][sheard_n_ofs] = b_buffer[i];
+    }
+  };
+
+  auto execute_sub_matmul = [&](int shead_mem_id) {
     for (int mr = 0; mr < Param::MR; ++mr) {
       for (int nr = 0; nr < Param::NR; ++nr) {
         for (int sheard_k_ofs = 0; sheard_k_ofs < Param::KB; ++sheard_k_ofs) {
           const int sheard_n_ofs = nr * Param::THREAD_X + tidx;
           const int sheard_m_ofs = mr * Param::THREAD_Y + tidy;
-          value[mr][nr] += shared_A[sheard_m_ofs][sheard_k_ofs] *
-                           shared_B[sheard_k_ofs][sheard_n_ofs];
+          value[mr][nr] += shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] *
+                           shared_B[shead_mem_id][sheard_k_ofs][sheard_n_ofs];
         }
       }
     }
+  };
+
+  int k_base = 0;
+  int shead_mem_id = 0;
+
+  // prologue of main loop
+  {
+    load_mem_to_reg(k_base);
+    store_reg_to_shared_mem(shead_mem_id);
+  }
+  // main loop
+  for (k_base += Param::KB; k_base + Param::KB <= K; k_base += Param::KB) {
     __syncthreads();
+    load_mem_to_reg(k_base);
+    execute_sub_matmul(shead_mem_id);
+    shead_mem_id ^= 1;
+    store_reg_to_shared_mem(shead_mem_id);
+  }
+  // epilogue of main loop
+  {
+    __syncthreads();
+    execute_sub_matmul(shead_mem_id);
   }
 
   for (int k_ofs = k_base; k_ofs < K; ++k_ofs) {

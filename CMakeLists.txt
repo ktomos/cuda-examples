@@ -17,4 +17,4 @@ include_directories(include)
 cuda_add_executable(test_gemm src/gemm.cu test/test_gemm.cpp)
 target_link_libraries(test_gemm GTest::GTest GTest::Main)
 
-cuda_add_executable(gemm_bench test/gemm_bench.cpp src/gemm.cu)
+cuda_add_executable(gemm_bench test/gemm_bench.cpp src/gemm.cu src/warmup.cu)

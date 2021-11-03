@@ -2,6 +2,8 @@
 #include <memory>
 #include <random>
 
+extern int cuda_warmup();
+
 template <typename T, class Fn>
 void call_gemm(Fn gemm_func, size_t m, size_t n, size_t k, T alpha, T beta) {
 
@@ -29,6 +31,7 @@ void call_gemm(Fn gemm_func, size_t m, size_t n, size_t k, T alpha, T beta) {
 }
 
 int main() {
+  cuda_warmup();
 
   printf("%4s, %4s, %4s, %8s, %9s\n", "M", "N", "K", "GFLOPS", "sec");
   for (size_t size = 16; size <= 8192; size *= 2) {

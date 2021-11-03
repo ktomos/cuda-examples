@@ -22,6 +22,7 @@ template void gemm_cpu(const size_t m, const size_t n, const size_t k,
 struct GemmParam {
   static constexpr int THREAD_X = 16;
   static constexpr int THREAD_Y = 16;
+  static constexpr int THREAD_XY = THREAD_X * THREAD_Y;
 
   // register blocking per thread
   static constexpr int MR = 8;
@@ -54,12 +55,16 @@ __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
   T a_buffer[Param::N_LOADS_A], b_buffer[Param::N_LOADS_B];
 
   auto load_mem_to_reg = [&](int k_base) {
+  // load A from device memory
+#pragma unroll
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
       const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
       const int sheard_m_ofs = index / Param::KB;
       const int sheard_k_ofs = index % Param::KB;
       a_buffer[i] = A[(m_base + sheard_m_ofs) * K + (k_base + sheard_k_ofs)];
     }
+    // load B from device memory
+#pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
       const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
       const int sheard_k_ofs = index / Param::NB;
@@ -69,12 +74,16 @@ __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
   };
 
   auto store_reg_to_shared_mem = [&](int shead_mem_id) {
+  // store A to shared memory
+#pragma unroll
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
       const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
       const int sheard_m_ofs = index / Param::KB;
       const int sheard_k_ofs = index % Param::KB;
       shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] = a_buffer[i];
     }
+    // store B to shared memory
+#pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
       const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
       const int sheard_k_ofs = index / Param::NB;
@@ -84,8 +93,13 @@ __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
   };
 
   auto execute_sub_matmul = [&](int shead_mem_id) {
+  // execute MR X NR X KB sub matmul per thread
+  // (= execute MB X NB X KB sub matmul per grid)
+#pragma unroll
     for (int mr = 0; mr < Param::MR; ++mr) {
+#pragma unroll
       for (int nr = 0; nr < Param::NR; ++nr) {
+#pragma unroll
         for (int sheard_k_ofs = 0; sheard_k_ofs < Param::KB; ++sheard_k_ofs) {
           const int sheard_n_ofs = nr * Param::THREAD_X + tidx;
           const int sheard_m_ofs = mr * Param::THREAD_Y + tidy;
@@ -98,7 +112,6 @@ __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
 
   int k_base = 0;
   int shead_mem_id = 0;
-
   // prologue of main loop
   {
     load_mem_to_reg(k_base);
@@ -118,8 +131,11 @@ __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
     execute_sub_matmul(shead_mem_id);
   }
 
+  // rest of K blocking
   for (int k_ofs = k_base; k_ofs < K; ++k_ofs) {
+#pragma unroll
     for (int mr = 0; mr < Param::MR; ++mr) {
+#pragma unroll
       for (int nr = 0; nr < Param::NR; ++nr) {
         const int n_ofs = n_base + nr * Param::THREAD_X + tidx;
         const int m_ofs = m_base + mr * Param::THREAD_Y + tidy;
@@ -128,7 +144,10 @@ __global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
     }
   }
 
+  // store results to device memory
+#pragma unroll
   for (int mr = 0; mr < Param::MR; ++mr) {
+#pragma unroll
     for (int nr = 0; nr < Param::NR; ++nr) {
       const int n_ofs = n_base + nr * Param::THREAD_X + tidx;
       const int m_ofs = m_base + mr * Param::THREAD_Y + tidy;

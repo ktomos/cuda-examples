@@ -41,7 +41,7 @@ struct GemmParam {
 };
 
 template <typename T, typename Param>
-__global__ void gemm_kernel(const size_t M, const size_t N, const size_t K,
+__global__ void gemm_kernel(const int M, const int N, const int K,
                             const T alpha, const T *A, const T *B, const T beta,
                             T *C) {
   __shared__ T shared_A[2][Param::MB][Param::KB]; // 2 x MB x KB

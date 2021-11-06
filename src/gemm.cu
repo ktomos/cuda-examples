@@ -118,7 +118,7 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
     store_reg_to_shared_mem(shead_mem_id);
   }
   // main loop
-  for (k_base += Param::KB; k_base + Param::KB <= K; k_base += Param::KB) {
+  for (k_base += Param::KB; k_base < K - Param::KB; k_base += Param::KB) {
     __syncthreads();
     load_mem_to_reg(k_base);
     execute_sub_matmul(shead_mem_id);

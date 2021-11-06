@@ -50,26 +50,50 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   const int n_base = blockIdx.x * Param::NB;
   const int m_base = blockIdx.y * Param::MB;
   const int tidx = threadIdx.x, tidy = threadIdx.y;
+  const int tid = tidy * Param::THREAD_X + tidx;
 
   T value[Param::MR][Param::NR] = {};
   T a_buffer[Param::N_LOADS_A], b_buffer[Param::N_LOADS_B];
+
+  const float *A_ofs[Param::N_LOADS_A], *B_ofs[Param::N_LOADS_B];
+
+  // init device memory load offset of A
+#pragma unroll
+  for (int i = 0; i < Param::N_LOADS_A; ++i) {
+    const int index = i * Param::THREAD_XY + tid;
+    const int m_ofs = m_base + index / Param::KB;
+    const int k_ofs = 0 + index % Param::KB;
+    A_ofs[i] = A + (m_ofs)*K + k_ofs;
+  }
+  // init device memory load offset of B
+#pragma unroll
+  for (int i = 0; i < Param::N_LOADS_B; ++i) {
+    const int index = i * Param::THREAD_XY + tid;
+    const int k_ofs = 0 + index / Param::NB;
+    const int n_ofs = n_base + index % Param::NB;
+    B_ofs[i] = B + (k_ofs)*N + n_ofs;
+  }
 
   auto load_mem_to_reg = [&](int k_base) {
   // load A from device memory
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
-      const int sheard_m_ofs = index / Param::KB;
-      const int sheard_k_ofs = index % Param::KB;
-      a_buffer[i] = A[(m_base + sheard_m_ofs) * K + (k_base + sheard_k_ofs)];
+      a_buffer[i] = *A_ofs[i];
     }
     // load B from device memory
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
-      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
-      const int sheard_k_ofs = index / Param::NB;
-      const int sheard_n_ofs = index % Param::NB;
-      b_buffer[i] = B[(k_base + sheard_k_ofs) * N + (n_base + sheard_n_ofs)];
+      b_buffer[i] = *B_ofs[i];
+    }
+    // update device memory offset of A
+#pragma unroll
+    for (int i = 0; i < Param::N_LOADS_A; ++i) {
+      A_ofs[i] += Param::KB;
+    }
+    // update device memory offset of B
+#pragma unroll
+    for (int i = 0; i < Param::N_LOADS_B; ++i) {
+      B_ofs[i] += Param::KB * N;
     }
   };
 

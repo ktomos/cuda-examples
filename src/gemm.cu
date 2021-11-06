@@ -111,21 +111,33 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   };
 
   int k_base = 0;
-  int shead_mem_id = 0;
   // prologue of main loop
   {
     load_mem_to_reg(k_base);
-    store_reg_to_shared_mem(shead_mem_id);
+    store_reg_to_shared_mem(0);
   }
   // main loop
-  for (k_base += Param::KB; k_base < K - Param::KB; k_base += Param::KB) {
+  for (k_base += Param::KB; k_base < K - Param::KB * 2;
+       k_base += Param::KB * 2) {
+    __syncthreads();
+    load_mem_to_reg(k_base);
+    execute_sub_matmul(0);
+    store_reg_to_shared_mem(1);
+    __syncthreads();
+    load_mem_to_reg(k_base + Param::KB);
+    execute_sub_matmul(1);
+    store_reg_to_shared_mem(0);
+  }
+  // epilogue of main loop
+  int shead_mem_id = 0;
+  if (k_base < K - Param::KB) {
     __syncthreads();
     load_mem_to_reg(k_base);
     execute_sub_matmul(shead_mem_id);
     shead_mem_id ^= 1;
     store_reg_to_shared_mem(shead_mem_id);
+    k_base += Param::KB;
   }
-  // epilogue of main loop
   {
     __syncthreads();
     execute_sub_matmul(shead_mem_id);
@@ -144,7 +156,7 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
     }
   }
 
-  // store results to device memory
+// store results to device memory
 #pragma unroll
   for (int mr = 0; mr < Param::MR; ++mr) {
 #pragma unroll

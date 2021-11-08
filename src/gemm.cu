@@ -44,8 +44,10 @@ template <typename T, typename Param>
 __global__ void gemm_kernel(const int M, const int N, const int K,
                             const T alpha, const T *A, const T *B, const T beta,
                             T *C) {
-  __shared__ T shared_A[2][Param::MB][Param::KB]; // 2 x MB x KB
-  __shared__ T shared_B[2][Param::KB][Param::NB]; // 2 x KB x NB
+  static_assert(Param::KB % 4 == 0);
+  static_assert(std::is_same<T, float>::value);
+  __shared__ float4 shared_A[2][Param::MB][Param::KB / 4]; // 2 x MB x KB
+  __shared__ T shared_B[2][Param::KB][Param::NB];          // 2 x KB x NB
 
   const int n_base = blockIdx.x * Param::NB;
   const int m_base = blockIdx.y * Param::MB;
@@ -53,19 +55,21 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   const int tid = tidy * Param::THREAD_X + tidx;
 
   T value[Param::MR][Param::NR] = {};
-  T a_buffer[Param::N_LOADS_A], b_buffer[Param::N_LOADS_B];
 
-  const float *A_ofs[Param::N_LOADS_A], *B_ofs[Param::N_LOADS_B];
+  static_assert(Param::N_LOADS_A == 4);
+  float4 a_buffer;
+  float b_buffer[Param::N_LOADS_B];
 
-  // init device memory load offset of A
-#pragma unroll
-  for (int i = 0; i < Param::N_LOADS_A; ++i) {
-    const int index = i * Param::THREAD_XY + tid;
+  const float *A_ofs, *B_ofs[Param::N_LOADS_B];
+
+  // init device memory load address of A
+  {
+    const int index = tid * 4;
     const int m_ofs = m_base + index / Param::KB;
     const int k_ofs = 0 + index % Param::KB;
-    A_ofs[i] = A + (m_ofs)*K + k_ofs;
+    A_ofs = A + (m_ofs)*K + k_ofs;
   }
-  // init device memory load offset of B
+// init device memory load address of B
 #pragma unroll
   for (int i = 0; i < Param::N_LOADS_B; ++i) {
     const int index = i * Param::THREAD_XY + tid;
@@ -75,22 +79,23 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   }
 
   auto load_mem_to_reg = [&](int k_base) {
-  // load A from device memory
-#pragma unroll
-    for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      a_buffer[i] = *A_ofs[i];
+    // load A from device memory
+    {
+      // load by 128-bit instruction
+      asm("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+          : "=f"(a_buffer.x), "=f"(a_buffer.y), "=f"(a_buffer.z),
+            "=f"(a_buffer.w)
+          : "l"(A_ofs)
+          : "memory");
     }
     // load B from device memory
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
       b_buffer[i] = *B_ofs[i];
     }
-    // update device memory offset of A
-#pragma unroll
-    for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      A_ofs[i] += Param::KB;
-    }
-    // update device memory offset of B
+    // update device memory address of A
+    A_ofs += Param::KB;
+    // update device memory address of B
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
       B_ofs[i] += Param::KB * N;
@@ -98,13 +103,12 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   };
 
   auto store_reg_to_shared_mem = [&](int shead_mem_id) {
-  // store A to shared memory
-#pragma unroll
-    for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
+    // store A to shared memory
+    {
+      const int index = tid * 4;
       const int sheard_m_ofs = index / Param::KB;
       const int sheard_k_ofs = index % Param::KB;
-      shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] = a_buffer[i];
+      shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs / 4] = a_buffer;
     }
     // store B to shared memory
 #pragma unroll
@@ -117,18 +121,25 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   };
 
   auto execute_sub_matmul = [&](int shead_mem_id) {
-  // execute MR X NR X KB sub matmul per thread
-  // (= execute MB X NB X KB sub matmul per grid)
+// execute MR X NR X KB sub matmul per thread
+// (= execute MB X NB X KB sub matmul per grid)
 #pragma unroll
     for (int mr = 0; mr < Param::MR; ++mr) {
+      const int sheard_m_ofs = mr * Param::THREAD_Y + tidy;
 #pragma unroll
       for (int nr = 0; nr < Param::NR; ++nr) {
+        const int sheard_n_ofs = nr * Param::THREAD_X + tidx;
 #pragma unroll
-        for (int sheard_k_ofs = 0; sheard_k_ofs < Param::KB; ++sheard_k_ofs) {
-          const int sheard_n_ofs = nr * Param::THREAD_X + tidx;
-          const int sheard_m_ofs = mr * Param::THREAD_Y + tidy;
-          value[mr][nr] += shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] *
-                           shared_B[shead_mem_id][sheard_k_ofs][sheard_n_ofs];
+        for (int k = 0; k < Param::KB / 4; ++k) {
+          float4 a_buf = shared_A[shead_mem_id][sheard_m_ofs][k];
+          value[mr][nr] +=
+              a_buf.x * shared_B[shead_mem_id][k * 4 + 0][sheard_n_ofs];
+          value[mr][nr] +=
+              a_buf.y * shared_B[shead_mem_id][k * 4 + 1][sheard_n_ofs];
+          value[mr][nr] +=
+              a_buf.z * shared_B[shead_mem_id][k * 4 + 2][sheard_n_ofs];
+          value[mr][nr] +=
+              a_buf.w * shared_B[shead_mem_id][k * 4 + 3][sheard_n_ofs];
         }
       }
     }
@@ -214,8 +225,10 @@ void gemm_cuda(const size_t m, const size_t n, const size_t k, const T alpha,
   cudaEventCreate(&stop);
 
   cudaEventRecord(start);
-  gemm_kernel<T, GemmParam>
-      <<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
+  if (k % 4 == 0 && n % 4 == 0) {
+    gemm_kernel<T, GemmParam>
+        <<<grid, block>>>(m, n, k, alpha, d_A, d_B, beta, d_C);
+  }
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);

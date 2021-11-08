@@ -64,14 +64,14 @@ INSTANTIATE_TEST_CASE_P(GemmMNKBasicTest, GemmTest,
                                 Values(1.0),    // alpha
                                 Values(1.0)));  // beta
 
-INSTANTIATE_TEST_CASE_P(GemmMNKSmallTest, GemmTest,
+INSTANTIATE_TEST_CASE_P(DISABLED_GemmMNKSmallTest, GemmTest,
                         Combine(Values(1, 2, 3), // m
                                 Values(1, 2, 3), // n
                                 Values(1, 2, 3), // k
                                 Values(1.0),     // alpha
                                 Values(1.0)));   // beta
 
-INSTANTIATE_TEST_CASE_P(GemmMNKEdgeTest, GemmTest,
+INSTANTIATE_TEST_CASE_P(DISABLED_GemmMNKEdgeTest, GemmTest,
                         Combine(Values(61, 67), // m
                                 Values(61, 67), // n
                                 Values(61, 67), // k

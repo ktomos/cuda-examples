@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(CUDA 11.0 REQUIRED)
 message(STATUS "Found CUDA ${CUDA_VERSION_STRING} at ${CUDA_TOOLKIT_ROOT_DIR}")
 cuda_select_nvcc_arch_flags(ARCH_FLAGS Auto)
-list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS} -O2)
+list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS} -std=c++17 -O2)
 
 cuda_add_executable(hello_world src/helo_world.cu)
 

@@ -53,70 +53,69 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   const int tid = tidy * Param::THREAD_X + tidx;
 
   T value[Param::MR][Param::NR] = {};
-  T a_buffer[Param::N_LOADS_A], b_buffer[Param::N_LOADS_B];
+  T a_reg[Param::N_LOADS_A], b_reg[Param::N_LOADS_B];
+  const float *A_gofs[Param::N_LOADS_A], *B_gofs[Param::N_LOADS_B];
 
-  const float *A_ofs[Param::N_LOADS_A], *B_ofs[Param::N_LOADS_B];
-
-  // init device memory load offset of A
+  // init global memory load offset of A
 #pragma unroll
   for (int i = 0; i < Param::N_LOADS_A; ++i) {
     const int index = i * Param::THREAD_XY + tid;
-    const int m_ofs = m_base + index / Param::KB;
-    const int k_ofs = 0 + index % Param::KB;
-    A_ofs[i] = A + (m_ofs)*K + k_ofs;
+    const int m_gofs = m_base + index / Param::KB;
+    const int k_gofs = 0 + index % Param::KB;
+    A_gofs[i] = A + (m_gofs)*K + k_gofs;
   }
-  // init device memory load offset of B
+  // init global memory load offset of B
 #pragma unroll
   for (int i = 0; i < Param::N_LOADS_B; ++i) {
     const int index = i * Param::THREAD_XY + tid;
-    const int k_ofs = 0 + index / Param::NB;
-    const int n_ofs = n_base + index % Param::NB;
-    B_ofs[i] = B + (k_ofs)*N + n_ofs;
+    const int k_gofs = 0 + index / Param::NB;
+    const int n_gofs = n_base + index % Param::NB;
+    B_gofs[i] = B + (k_gofs)*N + n_gofs;
   }
 
-  auto load_mem_to_reg = [&](int k_base) {
-  // load A from device memory
+  auto load_mem_to_reg = [&]() {
+  // load A from global memory (MB X KB per grid)
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      a_buffer[i] = *A_ofs[i];
+      a_reg[i] = *A_gofs[i];
     }
-    // load B from device memory
+    // load B from global memory (KB x NB per grid)
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
-      b_buffer[i] = *B_ofs[i];
+      b_reg[i] = *B_gofs[i];
     }
-    // update device memory offset of A
+    // update global memory offset of A
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      A_ofs[i] += Param::KB;
+      A_gofs[i] += Param::KB;
     }
-    // update device memory offset of B
+    // update global memory offset of B
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
-      B_ofs[i] += Param::KB * N;
+      B_gofs[i] += Param::KB * N;
     }
   };
 
-  auto store_reg_to_shared_mem = [&](int shead_mem_id) {
-  // store A to shared memory
+  auto store_reg_to_shared_mem = [&](int shead_page) {
+  // store A to shared memory (MB X KB per grid)
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_A; ++i) {
-      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
-      const int sheard_m_ofs = index / Param::KB;
-      const int sheard_k_ofs = index % Param::KB;
-      shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] = a_buffer[i];
+      const int index = i * Param::THREAD_XY + tid;
+      const int m_lofs = index / Param::KB;
+      const int k_lofs = index % Param::KB;
+      shared_A[shead_page][m_lofs][k_lofs] = a_reg[i];
     }
-    // store B to shared memory
+    // store B to shared memory (KB x NB per grid)
 #pragma unroll
     for (int i = 0; i < Param::N_LOADS_B; ++i) {
-      const int index = (i * Param::THREAD_Y + tidy) * Param::THREAD_X + tidx;
-      const int sheard_k_ofs = index / Param::NB;
-      const int sheard_n_ofs = index % Param::NB;
-      shared_B[shead_mem_id][sheard_k_ofs][sheard_n_ofs] = b_buffer[i];
+      const int index = i * Param::THREAD_XY + tid;
+      const int k_lofs = index / Param::NB;
+      const int n_lofs = index % Param::NB;
+      shared_B[shead_page][k_lofs][n_lofs] = b_reg[i];
     }
   };
 
-  auto execute_sub_matmul = [&](int shead_mem_id) {
+  auto execute_sub_matmul = [&](int shead_page) {
   // execute MR X NR X KB sub matmul per thread
   // (= execute MB X NB X KB sub matmul per grid)
 #pragma unroll
@@ -124,11 +123,11 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
 #pragma unroll
       for (int nr = 0; nr < Param::NR; ++nr) {
 #pragma unroll
-        for (int sheard_k_ofs = 0; sheard_k_ofs < Param::KB; ++sheard_k_ofs) {
-          const int sheard_n_ofs = nr * Param::THREAD_X + tidx;
-          const int sheard_m_ofs = mr * Param::THREAD_Y + tidy;
-          value[mr][nr] += shared_A[shead_mem_id][sheard_m_ofs][sheard_k_ofs] *
-                           shared_B[shead_mem_id][sheard_k_ofs][sheard_n_ofs];
+        for (int k_lofs = 0; k_lofs < Param::KB; ++k_lofs) {
+          const int n_lofs = nr * Param::THREAD_X + tidx;
+          const int m_lofs = mr * Param::THREAD_Y + tidy;
+          value[mr][nr] += shared_A[shead_page][m_lofs][k_lofs] *
+                           shared_B[shead_page][k_lofs][n_lofs];
         }
       }
     }
@@ -137,58 +136,58 @@ __global__ void gemm_kernel(const int M, const int N, const int K,
   int k_base = 0;
   // prologue of main loop
   {
-    load_mem_to_reg(k_base);
+    load_mem_to_reg();
     store_reg_to_shared_mem(0);
   }
   // main loop
-  for (k_base += Param::KB; k_base < K - Param::KB * 2;
-       k_base += Param::KB * 2) {
+  constexpr int KB2 = Param::KB * 2;
+  for (k_base += Param::KB; k_base < K - KB2; k_base += KB2) {
     __syncthreads();
-    load_mem_to_reg(k_base);
+    load_mem_to_reg();
     execute_sub_matmul(0);
     store_reg_to_shared_mem(1);
     __syncthreads();
-    load_mem_to_reg(k_base + Param::KB);
+    load_mem_to_reg();
     execute_sub_matmul(1);
     store_reg_to_shared_mem(0);
   }
   // epilogue of main loop
-  int shead_mem_id = 0;
+  int shead_page = 0;
   if (k_base < K - Param::KB) {
     __syncthreads();
-    load_mem_to_reg(k_base);
-    execute_sub_matmul(shead_mem_id);
-    shead_mem_id ^= 1;
-    store_reg_to_shared_mem(shead_mem_id);
+    load_mem_to_reg();
+    execute_sub_matmul(shead_page);
+    shead_page ^= 1;
+    store_reg_to_shared_mem(shead_page);
     k_base += Param::KB;
   }
   {
     __syncthreads();
-    execute_sub_matmul(shead_mem_id);
+    execute_sub_matmul(shead_page);
   }
 
   // rest of K blocking
-  for (int k_ofs = k_base; k_ofs < K; ++k_ofs) {
+  for (int k_gofs = k_base; k_gofs < K; ++k_gofs) {
 #pragma unroll
     for (int mr = 0; mr < Param::MR; ++mr) {
 #pragma unroll
       for (int nr = 0; nr < Param::NR; ++nr) {
-        const int n_ofs = n_base + nr * Param::THREAD_X + tidx;
-        const int m_ofs = m_base + mr * Param::THREAD_Y + tidy;
-        value[mr][nr] += A[m_ofs * K + k_ofs] * B[k_ofs * N + n_ofs];
+        const int n_gofs = n_base + nr * Param::THREAD_X + tidx;
+        const int m_gofs = m_base + mr * Param::THREAD_Y + tidy;
+        value[mr][nr] += A[m_gofs * K + k_gofs] * B[k_gofs * N + n_gofs];
       }
     }
   }
 
-// store results to device memory
+// store results to global memory
 #pragma unroll
   for (int mr = 0; mr < Param::MR; ++mr) {
 #pragma unroll
     for (int nr = 0; nr < Param::NR; ++nr) {
-      const int n_ofs = n_base + nr * Param::THREAD_X + tidx;
-      const int m_ofs = m_base + mr * Param::THREAD_Y + tidy;
-      if (n_ofs < N && m_ofs < M) {
-        C[m_ofs * N + n_ofs] = alpha * value[mr][nr] + beta;
+      const int n_gofs = n_base + nr * Param::THREAD_X + tidx;
+      const int m_gofs = m_base + mr * Param::THREAD_Y + tidy;
+      if (n_gofs < N && m_gofs < M) {
+        C[m_gofs * N + n_gofs] = alpha * value[mr][nr] + beta;
       }
     }
   }
